@@ -70,10 +70,12 @@ NETWORK_TOOLS = re.compile(
 # sequence them, so each can be checked for a write destination on its own.
 CMD_SPLIT = re.compile(r"[;&|\n]+")
 # A command may be invoked via a full/relative path (`/bin/cp`, `/usr/bin/
-# mkdir`) or through `env` instead of its bare name - match that prefix
-# optionally so `/bin/cp x /etc/y` isn't invisible to the checks below just
-# because the segment doesn't start with the literal word "cp".
-_CMD_PREFIX = r"(?:sudo\s+)?(?:env\s+)?(?:[\w./-]*/)?"
+# mkdir`), through `env`, or with one or more leading `VAR=value` shell
+# assignments (`FOO=bar cp ...`) instead of its bare name - match all of
+# that optionally so none of these common wrapping forms are invisible to
+# the checks below just because the segment doesn't start with the literal
+# command word.
+_CMD_PREFIX = r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:sudo\s+)?(?:env\s+)?(?:[\w./-]*/)?"
 # Recognises a `cd <dir>` inside a single segment (used to track the cwd in
 # effect for whatever comes later on the same line).
 CD_CMD = re.compile(r"^" + _CMD_PREFIX + r"cd\s+([^\s;|&]+)", re.I)
@@ -302,9 +304,37 @@ def _bash_write_targets(text, start_cwd):
 
         m = DEST_LAST_CMDS.match(seg)
         if m:
-            toks = [t for t in m.group(2).split() if t and not t.startswith("-")]
-            if len(toks) >= 2:
-                results.append((toks[-1], cwd))
+            args = m.group(2).split()
+            # `cp`/`rsync` support `-t DIR` / `--target-directory=DIR`, which
+            # names the real destination directory up front - the "last
+            # positional arg" heuristic below would then misidentify one of
+            # the *sources* as the destination instead (over-blocking a
+            # legitimate write, or missing an escape hidden behind a source
+            # that looks safe).
+            target = None
+            positionals = []
+            i = 0
+            while i < len(args):
+                tok = args[i]
+                if tok in ("-t", "--target-directory") and i + 1 < len(args):
+                    target = args[i + 1]
+                    i += 2
+                    continue
+                if tok.startswith("--target-directory="):
+                    target = tok.split("=", 1)[1]
+                    i += 1
+                    continue
+                if tok.startswith("-t") and len(tok) > 2 and not tok.startswith("--"):
+                    target = tok[2:]  # glued short form, e.g. -t/some/dir
+                    i += 1
+                    continue
+                if not tok.startswith("-"):
+                    positionals.append(tok)
+                i += 1
+            if target is not None:
+                results.append((target, cwd))
+            elif len(positionals) >= 2:
+                results.append((positionals[-1], cwd))
             continue
 
         m = DEST_ALL_CMDS.match(seg)
