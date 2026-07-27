@@ -69,16 +69,21 @@ NETWORK_TOOLS = re.compile(
 # Splits a command line into simple commands the same way a shell would
 # sequence them, so each can be checked for a write destination on its own.
 CMD_SPLIT = re.compile(r"[;&|\n]+")
+# A command may be invoked via a full/relative path (`/bin/cp`, `/usr/bin/
+# mkdir`) or through `env` instead of its bare name - match that prefix
+# optionally so `/bin/cp x /etc/y` isn't invisible to the checks below just
+# because the segment doesn't start with the literal word "cp".
+_CMD_PREFIX = r"(?:sudo\s+)?(?:env\s+)?(?:[\w./-]*/)?"
 # Recognises a `cd <dir>` inside a single segment (used to track the cwd in
 # effect for whatever comes later on the same line).
-CD_CMD = re.compile(r"^(?:sudo\s+)?cd\s+([^\s;|&]+)", re.I)
+CD_CMD = re.compile(r"^" + _CMD_PREFIX + r"cd\s+([^\s;|&]+)", re.I)
 # Copy-style commands whose LAST positional arg is the write destination
 # (sources before it are only reads and stay allowed).
-DEST_LAST_CMDS = re.compile(r"^(?:sudo\s+)?(cp|mv|install|rsync|ln)\b\s+(.*)$", re.I)
+DEST_LAST_CMDS = re.compile(r"^" + _CMD_PREFIX + r"(cp|mv|install|rsync|ln)\b\s+(.*)$", re.I)
 # Commands where EVERY positional arg is a path being created / written.
-DEST_ALL_CMDS = re.compile(r"^(?:sudo\s+)?(touch|mkdir|truncate|mkfifo|mknod)\b\s+(.*)$", re.I)
-DD_CMD = re.compile(r"^(?:sudo\s+)?dd\b(.*)$", re.I)
-SED_INPLACE = re.compile(r"^(?:sudo\s+)?sed\b(.*)$", re.I)
+DEST_ALL_CMDS = re.compile(r"^" + _CMD_PREFIX + r"(touch|mkdir|truncate|mkfifo|mknod)\b\s+(.*)$", re.I)
+DD_CMD = re.compile(r"^" + _CMD_PREFIX + r"dd\b(.*)$", re.I)
+SED_INPLACE = re.compile(r"^" + _CMD_PREFIX + r"sed\b(.*)$", re.I)
 # Redirect operators (>, >>, >|) and tee - capture the file that follows.
 REDIRECT = re.compile(r"(?:>>?\|?|\btee\b(?:\s+-a)?)\s*([^\s;|&'\"]+)")
 
