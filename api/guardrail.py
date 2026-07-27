@@ -69,6 +69,9 @@ NETWORK_TOOLS = re.compile(
 # Splits a command line into simple commands the same way a shell would
 # sequence them, so each can be checked for a write destination on its own.
 CMD_SPLIT = re.compile(r"[;&|\n]+")
+# Recognises a `cd <dir>` inside a single segment (used to track the cwd in
+# effect for whatever comes later on the same line).
+CD_CMD = re.compile(r"^(?:sudo\s+)?cd\s+([^\s;|&]+)", re.I)
 # Copy-style commands whose LAST positional arg is the write destination
 # (sources before it are only reads and stay allowed).
 DEST_LAST_CMDS = re.compile(r"^(?:sudo\s+)?(cp|mv|install|rsync|ln)\b\s+(.*)$", re.I)
@@ -208,62 +211,34 @@ def is_under(path, root):
     return path == root or path.startswith(root + "/")
 
 
-def _bash_write_targets(text):
-    """Every path a bash command line would WRITE to (create/modify/truncate).
+def _iter_segments_with_cwd(text, start_cwd):
+    """Yield (segment_text, cwd_in_effect_at_that_segment) pairs.
 
-    Covers redirects (>, >>, >|, tee), copy-style commands (cp/mv/install/
-    rsync/ln -> last arg), file-creators (touch/mkdir/truncate/mkfifo/mknod ->
-    all args), dd (of=), and sed -i (its file arg). Sources/reads are never
-    returned, so `cp notes.txt <write_root>/x` still lets the read of the
-    source through - only the destination is judged against the write root.
+    Mirrors how a shell actually executes a `;`/`&&`/`|`-joined line: a `cd`
+    changes the directory for whatever comes *after* it on the line, but must
+    never retroactively change the base used for something that already ran
+    earlier on the same line. Using a single "last cd wins" base for every
+    write on the line (the previous approach) misjudges lines like
+    `cd build && echo hi > out.txt && cd /home/agent` - the write happens
+    while the cwd is still `build`, not after the second `cd`.
     """
-    targets = []
-
-    # Redirects apply to the whole line regardless of the leading command.
-    for m in REDIRECT.finditer(text):
-        tgt = m.group(1)
-        if tgt not in ("/dev/null", "/dev/stdout", "/dev/stderr", "&1", "&2"):
-            targets.append(tgt)
-
+    cwd = start_cwd
     for seg in CMD_SPLIT.split(text):
         seg = seg.strip()
         if not seg:
             continue
-
-        m = DD_CMD.match(seg)
+        yield seg, cwd
+        m = CD_CMD.match(seg)
         if m:
-            of_m = re.search(r"\bof=([^\s]+)", m.group(1))
-            if of_m:
-                targets.append(of_m.group(1))
-            continue
-
-        m = SED_INPLACE.match(seg)
-        if m and re.search(r"(?:^|\s)(-i\b|-i\S*|--in-place)", m.group(1)):
-            # In-place edit: the last non-option token is the file rewritten.
-            toks = [t for t in m.group(1).split() if t and not t.startswith("-")]
-            if toks:
-                targets.append(toks[-1])
-            continue
-
-        m = DEST_LAST_CMDS.match(seg)
-        if m:
-            toks = [t for t in m.group(2).split() if t and not t.startswith("-")]
-            if len(toks) >= 2:
-                targets.append(toks[-1])
-            continue
-
-        m = DEST_ALL_CMDS.match(seg)
-        if m:
-            for tok in m.group(2).split():
-                if tok and not tok.startswith("-"):
-                    targets.append(tok)
-            continue
-
-    return targets
+            cwd = canonicalize(m.group(1), cwd)
 
 
 def _cd_targets(text):
-    """Extra cwd candidates implied by a `cd ...` in the same command line."""
+    """Every directory a `cd` on this line could plausibly leave us in -
+    used only as extra candidate *bases* when hunting for reads of the
+    restricted secret. Being liberal here only makes secret-detection more
+    thorough, never less safe, so no sequencing is needed for this use.
+    """
     bases = []
     for m in re.finditer(r"\bcd\s+([^\s;|&]+)", text):
         target = canonicalize(m.group(1))
@@ -282,6 +257,59 @@ def _hits_secret(token, base):
         if fnmatchcase(SECRET, canon):
             return True
     return False
+
+
+def _bash_write_targets(text, start_cwd):
+    """Every (path, base_cwd) a bash command line would WRITE to
+    (create/modify/truncate), with the cwd that was actually in effect at
+    that point in the line - NOT just whatever the last `cd` on the line
+    happened to be.
+
+    Covers redirects (>, >>, >|, tee), copy-style commands (cp/mv/install/
+    rsync/ln -> last arg), file-creators (touch/mkdir/truncate/mkfifo/mknod ->
+    all args), dd (of=), and sed -i (its file arg). Sources/reads are never
+    returned, so `cp notes.txt <write_root>/x` still lets the read of the
+    source through - only the destination is judged against the write root.
+    """
+    results = []
+
+    for seg, cwd in _iter_segments_with_cwd(text, start_cwd):
+        # Redirects/tee can appear alongside a command in the same segment.
+        for m in REDIRECT.finditer(seg):
+            tgt = m.group(1)
+            if tgt not in ("/dev/null", "/dev/stdout", "/dev/stderr", "&1", "&2"):
+                results.append((tgt, cwd))
+
+        m = DD_CMD.match(seg)
+        if m:
+            of_m = re.search(r"\bof=([^\s]+)", m.group(1))
+            if of_m:
+                results.append((of_m.group(1), cwd))
+            continue
+
+        m = SED_INPLACE.match(seg)
+        if m and re.search(r"(?:^|\s)(-i\b|-i\S*|--in-place)", m.group(1)):
+            # In-place edit: the last non-option token is the file rewritten.
+            toks = [t for t in m.group(1).split() if t and not t.startswith("-")]
+            if toks:
+                results.append((toks[-1], cwd))
+            continue
+
+        m = DEST_LAST_CMDS.match(seg)
+        if m:
+            toks = [t for t in m.group(2).split() if t and not t.startswith("-")]
+            if len(toks) >= 2:
+                results.append((toks[-1], cwd))
+            continue
+
+        m = DEST_ALL_CMDS.match(seg)
+        if m:
+            for tok in m.group(2).split():
+                if tok and not tok.startswith("-"):
+                    results.append((tok, cwd))
+            continue
+
+    return results
 
 
 # --------------------------------------------------------------------------
@@ -336,9 +364,18 @@ def check_bash(command):
 
     for text in expand(command):
         low = text.lower()
-        # Substring backstop: any surviving mention of the secret's name,
-        # forwards or reversed (`echo crten. | rev`), is an attempt on it.
-        if SECRET_NAME in low or SECRET_REVERSED in low:
+        # Reversed-name substring backstop only: `echo crten. | rev` never
+        # produces a resolvable path token (the string is backwards), so the
+        # precise per-token path checks below can't see it - this is the one
+        # case that genuinely needs a bare substring catch. A *forward*
+        # substring check on the plain name was removed: it fired on any
+        # mention of the secret's basename anywhere in the command, which
+        # incorrectly blocked reads of a *different*, legitimately-located
+        # file that merely shares that filename (e.g. a copy sitting in the
+        # workspace). Every direct/obfuscated access to the *actual* secret
+        # path (~, $HOME, traversal, base64/hex-wrapped) is already caught
+        # precisely by the path-aware checks below, so nothing is lost.
+        if SECRET_REVERSED in low:
             return "block", SECRET_MSG
 
         bases = [CWD] + _cd_targets(text)
@@ -352,11 +389,12 @@ def check_bash(command):
 
         # Every write destination on the line - redirects, tee, cp/mv/ln,
         # touch/mkdir/truncate, dd, sed -i - must land inside the allowed
-        # write root. A bash write is not a loophole around write_file.
-        cd_bases = _cd_targets(text)
-        write_base = cd_bases[-1] if cd_bases else CWD
-        for target in _bash_write_targets(text):
-            canon = canonicalize(target, write_base)
+        # write root, judged against the cwd that was actually in effect at
+        # that point in the line (a later `cd` can't retroactively change
+        # where an earlier write landed). A bash write is not a loophole
+        # around write_file.
+        for target, base in _bash_write_targets(text, CWD):
+            canon = canonicalize(target, base)
             if canon == SECRET or not is_under(canon, WRITE_ROOT):
                 return "block", "Writing to %s is outside the allowed write root %s/." % (
                     canon, WRITE_ROOT)
